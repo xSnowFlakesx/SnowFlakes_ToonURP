@@ -1,0 +1,102 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+namespace SnowFlakes.Rendering
+{
+    public class SobelOutlineFeature : ScriptableRendererFeature
+    {
+        [System.Serializable]
+        public class Settings
+        {
+            public bool enable = true;
+            public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingPostProcessing;
+            public Shader shader; // optional override
+            public Color outlineColor = Color.black;
+            [Range(0.0f,4f)] public float width = 1f;
+            [Range(0f,5f)] public float depthSensitivity = 1f;
+            [Range(0f,5f)] public float colorSensitivity = 1f;
+            [Range(0f,5f)] public float intensity = 1f;
+            [Range(0f,1f)] public float threshold = 0.05f;
+            [Tooltip("Force vertical flip of source when result appears upside-down")] public bool flipY = false;
+        }
+
+        class Pass : ScriptableRenderPass
+        {
+            private Settings _s;
+            private Material _mat;
+            private RTHandle _tempColor;
+            private readonly string _tag = "Sobel Outline";
+            public Pass(Settings s, Material m){ _s = s; _mat = m; }
+
+            public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
+            {
+                if (!_s.enable || _mat == null) return;
+                var desc = renderingData.cameraData.cameraTargetDescriptor;
+                desc.depthBufferBits = 0;
+                // 后处理阶段不需要 MSAA; 统一为 1 避免 Blitter 断言 (源可能是 resolve 后 RT)
+                desc.msaaSamples = 1;
+                // 只需要颜色
+                RenderingUtils.ReAllocateIfNeeded(ref _tempColor, desc, name: "_SobelTemp");
+                // 请求深度 & 法线 (若启用 URP 选项) 以便 shader 使用
+                ConfigureInput(ScriptableRenderPassInput.Depth | ScriptableRenderPassInput.Normal);
+            }
+
+            public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+            {
+                if (!_s.enable || _mat == null) return;
+                var cmd = CommandBufferPool.Get(_tag);
+                using (new ProfilingScope(cmd, new ProfilingSampler(_tag)))
+                {
+                    var source = renderingData.cameraData.renderer.cameraColorTargetHandle;
+                    if (source == null || source.rt == null)
+                    {
+                        // 兼容某些 Editor 预览或未初始化情况
+                        context.ExecuteCommandBuffer(cmd);
+                        CommandBufferPool.Release(cmd);
+                        return;
+                    }
+                    if (_tempColor == null || _tempColor.rt == null)
+                    {
+                        context.ExecuteCommandBuffer(cmd);
+                        CommandBufferPool.Release(cmd);
+                        return;
+                    }
+                    _mat.SetColor("_OutlineColor", _s.outlineColor);
+                    _mat.SetVector("_Params", new Vector4(_s.width, _s.depthSensitivity, _s.colorSensitivity, _s.intensity));
+                    _mat.SetFloat("_Threshold", _s.threshold);
+                    _mat.SetFloat("_FlipY", _s.flipY ? 1f : 0f);
+                    // 使用 Blitter 做一次拷贝到临时 RT，再从临时 RT 回写带 outline
+                    Blitter.BlitCameraTexture(cmd, source, _tempColor);
+                    Blitter.BlitCameraTexture(cmd, _tempColor, source, _mat, 0);
+                }
+                context.ExecuteCommandBuffer(cmd);
+                CommandBufferPool.Release(cmd);
+            }
+        }
+
+        public Settings settings = new Settings();
+        private Material _mat;
+        private Pass _pass;
+
+        public override void Create()
+        {
+            if (settings.shader == null)
+                settings.shader = Shader.Find("Hidden/URP/SobelOutline");
+            if (settings.shader != null && _mat == null)
+                _mat = CoreUtils.CreateEngineMaterial(settings.shader);
+            _pass = new Pass(settings, _mat) { renderPassEvent = settings.renderPassEvent };
+        }
+
+        public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+        {
+            if (!settings.enable) return;
+            if (_mat == null && settings.shader != null)
+            {
+                _mat = CoreUtils.CreateEngineMaterial(settings.shader);
+                _pass = new Pass(settings, _mat) { renderPassEvent = settings.renderPassEvent };
+            }
+            renderer.EnqueuePass(_pass);
+        }
+    }
+}
