@@ -1,0 +1,139 @@
+Shader "Hidden/URP/SobelOutline"
+{
+    Properties
+    {
+        _OutlineColor ("Outline Color", Color) = (0,0,0,1)
+        _Params ("Params (Width,DepthSens,ColorSens,Intensity)", Vector) = (1,1,1,1)
+        _Threshold ("Edge Threshold", Range(0,1)) = 0.05
+        [Toggle]_Invert ("Invert Edge", Float) = 0
+    [Toggle]_FlipY ("Flip Y", Float) = 0
+    }
+    SubShader
+    {
+        Tags{ "RenderPipeline"="UniversalPipeline" }
+        ZWrite Off Cull Off ZTest Always
+        Pass
+        {
+            Name "SobelOutline"
+            HLSLPROGRAM
+            #pragma vertex FullscreenVert
+            #pragma fragment Frag
+            #pragma target 3.5
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            // URP14 某些版本可能没有 Fullscreen.hlsl，这里自定义全屏三角
+            struct Attributes { uint vertexID : SV_VertexID; };
+            struct Varyings { float4 positionCS : SV_POSITION; float2 texCoord : TEXCOORD0; };
+            Varyings FullscreenVert(Attributes IN)
+            {
+                Varyings o;
+                float2 uv = float2((IN.vertexID << 1) & 2, (IN.vertexID & 2)); // 0,0  2,0  0,2 pattern
+                o.positionCS = float4(uv * 2 - 1, 0, 1);
+                o.texCoord = uv;
+                return o;
+            }
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareNormalsTexture.hlsl"
+
+            TEXTURE2D_X(_BlitTexture); SAMPLER(sampler_PointClamp);
+            #ifdef UNITY_DECLARE_NORMAL_TEXTURE
+            TEXTURE2D_X(_CameraNormalsTexture); SAMPLER(sampler_CameraNormalsTexture);
+            #endif
+
+            float4 _OutlineColor;
+            float4 _Params; // x:width, y:depthSens, z:colorSens, w:intensity
+            float _Threshold; float _Invert; float _FlipY;
+
+            float3 SampleColor(float2 uv){ return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_PointClamp, uv).rgb; }
+
+            float Depth01(float2 uv)
+            {
+                #if defined(REQUIRES_DEPTH_TEXTURE)
+                return SampleSceneDepth(uv);
+                #else
+                return 1.0; // fallback (no depth info)
+                #endif
+            }
+
+            float3 SampleNormal(float2 uv)
+            {
+                #ifdef UNITY_DECLARE_NORMAL_TEXTURE
+                float4 n = SAMPLE_TEXTURE2D_X(_CameraNormalsTexture, sampler_CameraNormalsTexture, uv);
+                return normalize( n.xyz * 2 - 1 );
+                #else
+                return 0;
+                #endif
+            }
+
+            float SobelFloat(float s00,float s10,float s20,float s01,float s21,float s02,float s12,float s22)
+            {
+                float gx = (s20 + 2*s21 + s22) - (s00 + 2*s01 + s02);
+                float gy = (s02 + 2*s12 + s22) - (s00 + 2*s10 + s20);
+                return sqrt(gx*gx + gy*gy);
+            }
+
+            float SobelVec3(float3 c00,float3 c10,float3 c20,float3 c01,float3 c21,float3 c02,float3 c12,float3 c22)
+            {
+                float3 gx = (c20 + 2*c21 + c22) - (c00 + 2*c01 + c02);
+                float3 gy = (c02 + 2*c12 + c22) - (c00 + 2*c10 + c20);
+                return length(gx) + length(gy);
+            }
+
+            float4 Frag(Varyings input) : SV_Target
+            {
+                // 显式 Uniform 方式控制垂直翻转
+                float2 uv = input.texCoord;
+                uv.y = lerp(uv.y, 1 - uv.y, _FlipY);
+                float2 texel = _ScreenParams.zw * _Params.x; // scale by width
+
+                float2 oxy = texel;
+                float2 uv00 = uv - oxy;
+                float2 uv10 = uv - float2(0, texel.y);
+                float2 uv20 = uv + float2(texel.x, -texel.y);
+                float2 uv01 = uv - float2(texel.x, 0);
+                float2 uv21 = uv + float2(texel.x, 0);
+                float2 uv02 = uv + float2(-texel.x, texel.y);
+                float2 uv12 = uv + float2(0, texel.y);
+                float2 uv22 = uv + oxy;
+
+                float3 c00 = SampleColor(uv00);
+                float3 c10 = SampleColor(uv10);
+                float3 c20 = SampleColor(uv20);
+                float3 c01 = SampleColor(uv01);
+                float3 c21 = SampleColor(uv21);
+                float3 c02 = SampleColor(uv02);
+                float3 c12 = SampleColor(uv12);
+                float3 c22 = SampleColor(uv22);
+
+                float colorEdge = SobelVec3(c00,c10,c20,c01,c21,c02,c12,c22) * _Params.z;
+
+                float d00 = Depth01(uv00); float d10 = Depth01(uv10); float d20 = Depth01(uv20);
+                float d01 = Depth01(uv01); float d21 = Depth01(uv21);
+                float d02 = Depth01(uv02); float d12 = Depth01(uv12); float d22 = Depth01(uv22);
+                float depthEdge = SobelFloat(d00,d10,d20,d01,d21,d02,d12,d22) * _Params.y;
+
+                #ifdef UNITY_DECLARE_NORMAL_TEXTURE
+                float3 n00=SampleNormal(uv00); float3 n10=SampleNormal(uv10); float3 n20=SampleNormal(uv20);
+                float3 n01=SampleNormal(uv01); float3 n21=SampleNormal(uv21);
+                float3 n02=SampleNormal(uv02); float3 n12=SampleNormal(uv12); float3 n22=SampleNormal(uv22);
+                float normalEdge = SobelVec3(n00,n10,n20,n01,n21,n02,n12,n22);
+                #else
+                float normalEdge = 0;
+                #endif
+
+                float edgeMag = (colorEdge + normalEdge + depthEdge) * _Params.w;
+                // 正常逻辑：大于阈值判定为边
+                float edge = step(_Threshold, edgeMag);
+                // 若用户觉得“反了”可勾选 Invert（把静区作为描边）
+                if (_Invert > 0.5) edge = 1 - edge;
+
+                float4 src = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_PointClamp, uv);
+                float alpha = edge * _OutlineColor.a;
+                // 仅在边缘处覆盖颜色；也可改为加亮：outRgb = src.rgb + _OutlineColor.rgb * alpha;
+                float3 outRgb = lerp(src.rgb, _OutlineColor.rgb, alpha);
+                return float4(outRgb, src.a);
+            }
+            ENDHLSL
+        }
+    }
+}
