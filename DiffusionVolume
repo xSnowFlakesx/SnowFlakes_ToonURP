@@ -1,0 +1,38 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+namespace CustomPostProcessing
+{
+    [System.Serializable, VolumeComponentMenu("Custom Post-processing/Diffusion")] 
+    public class DiffusionVolume : VolumeComponent, IPostProcessComponent
+    {
+        public BoolParameter enable = new(true);
+        public ClampedFloatParameter intensity = new(1f,0f,1f);
+        public ClampedIntParameter downsample = new(2,1,4); // 1,2,4
+    public ClampedFloatParameter radius = new(3f,1f,16f); // 第一层基础核半径
+    public ClampedIntParameter iterations = new(1,1,4);  // 第一层迭代 (每次 H+V)
+        public BoolParameter highQuality = new(false);
+    // 暗部提取参数
+    public ClampedFloatParameter darkThreshold = new(0.4f, 0f, 1f);      // 阴影阈值
+    public ClampedFloatParameter darkSoftKnee = new(0.2f, 0f, 1f);       // 软膝
+    public ClampedFloatParameter darkPower = new(1.5f, 0.5f, 4f);        // (T-L)/T 的指数
+    // 双层扩散
+    public ClampedFloatParameter layer2Scale = new(2.5f, 1f, 6f);        // 第二层半径倍数
+    public ClampedFloatParameter layer1Weight = new(0.7f, 0f, 1f);       // A 权重；B=1-A
+    // 边缘保持（近似双边）
+    public ClampedFloatParameter bilateralSigma = new(0.15f, 0.01f, 0.5f); // 亮度差标准差
+    // 高光淡化窗口 (越接近 1 越抑制)
+    public ClampedFloatParameter highlightFadeStart = new(0.6f, 0f, 1f);
+    public ClampedFloatParameter highlightFadeEnd   = new(0.9f, 0f, 1f);
+    // 暖色偏 (调节扩散色调)
+    public ColorParameter warmTint = new(Color.Lerp(new Color(1.05f,1.0f,0.95f), Color.white, 0.5f), true, false, true);
+    // 可选边缘遮罩：使用深度 + 法线 差异抑制扩散（保线条）
+    public BoolParameter preserveEdges = new(false);
+    public ClampedFloatParameter edgeDepthThreshold = new(0.002f, 0.0001f, 0.01f); // 线性深度差阈值
+    public ClampedFloatParameter edgeNormalThreshold = new(0.1f, 0.01f, 1f);        // 法线角度阈值(1-dot)
+    public ClampedFloatParameter edgeStrength = new(0.8f, 0f, 1f);                  // 抑制强度
+        public bool IsActive() => enable.value && intensity.value>0f;
+        public bool IsTileCompatible()=>false;
+    }
+}
