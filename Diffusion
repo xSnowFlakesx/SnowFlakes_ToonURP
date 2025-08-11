@@ -1,0 +1,194 @@
+Shader "Hidden/Universal Render Pipeline/Diffusion" {
+    Properties { }
+    HLSLINCLUDE
+    #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+    // 注意：不在公共区声明 target/variants，避免部分平台生成空 snippet；改为各 Pass 内部单独声明。
+
+    struct Attributes { uint vertexID:SV_VertexID; };
+    struct Varyings { float4 positionCS:SV_POSITION; float2 uv:TEXCOORD0; };
+    Varyings Vert(Attributes v){ Varyings o; o.positionCS=GetFullScreenTriangleVertexPosition(v.vertexID); o.uv=GetFullScreenTriangleTexCoord(v.vertexID); return o; }
+
+    TEXTURE2D(_BlitTexture); SAMPLER(sampler_BlitTexture);
+    TEXTURE2D(_BlurATex);   SAMPLER(sampler_BlurATex); // 第一层模糊
+    TEXTURE2D(_BlurBTex);   SAMPLER(sampler_BlurBTex); // 第二层模糊
+    #define _MainTex _BlitTexture
+    float4 _BlitTexture_TexelSize;
+    float _Radius; float _Intensity; float _Layer1Weight; float _Layer2Scale; float _BilateralSigma; // reused registers
+    float _DarkThreshold; float _DarkSoftKnee; float _DarkPower; float4 _HighlightFade; float4 _WarmTint; // warmTint.rgb
+    float4 _EdgeParams1; // x depthThresh, y normalThresh, z strength, w enable
+    TEXTURE2D(_CameraDepthTexture); SAMPLER(sampler_CameraDepthTexture);
+    TEXTURE2D(_CameraNormalsTexture); SAMPLER(sampler_CameraNormalsTexture);
+
+    // 自定义深度采样（避免依赖未包含的 SampleSceneDepth 定义）
+    float SampleDepthRaw(float2 uv){
+        return SAMPLE_TEXTURE2D(_CameraDepthTexture, sampler_CameraDepthTexture, uv).r; // 平台差异由 LinearEyeDepth 处理
+    }
+    float LinearDepth(float2 uv){
+        float raw = SampleDepthRaw(uv);
+        return LinearEyeDepth(raw, _ZBufferParams);
+    }
+
+    // 暗部提取（与软膝）：输出暗区强度放大的颜色作为扩散源
+    float3 ExtractDark(float3 c){
+        float l = dot(c, float3(0.299,0.587,0.114));
+        if(_DarkThreshold <= 1e-4) return c; // 全量
+        float knee = _DarkThreshold * _DarkSoftKnee + 1e-5;
+        float x = (_DarkThreshold - l) + knee; // l < T 时正
+        x = clamp(x, 0.0, 2.0*knee);
+        x = (x*x)/(4.0*knee + 1e-5);
+        float hard = max(_DarkThreshold - l, 0.0);
+        float w = max(hard, x) / (_DarkThreshold + 1e-5);
+        w = pow(saturate(w), _DarkPower); // 曲线强化
+        return c * w;
+    }
+
+    float4 FragPrefilter(Varyings i):SV_Target{
+        float3 c = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv).rgb;
+        float3 d = ExtractDark(c);
+        return float4(d,1);
+    }
+    float4 FragBlurH(Varyings i):SV_Target{
+        float2 t = _BlitTexture_TexelSize.xy;
+        #ifdef DIFFUSION_HQ
+            int R = (int)clamp(_Radius,1,12);
+        #else
+            int R = (int)clamp(_Radius,1,6);
+        #endif
+        float sigma = max(_Radius,1);
+        float twoSigma2 = 2.0*sigma*sigma;
+        float3 col = 0; float wSum=0; float3 center = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv).rgb; float centerL = dot(center, float3(0.299,0.587,0.114));
+        [unroll] for(int r=-8;r<=8;r++){
+            #ifdef DIFFUSION_HQ
+                if(abs(r)>R) continue;
+            #else
+                if(abs(r)>R) continue;
+            #endif
+            float w = exp(-(r*r)/twoSigma2);
+            float2 o = float2(t.x*r,0);
+            float3 s = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv+o).rgb;
+            if(_BilateralSigma>0.0001){
+                float dl = dot(s, float3(0.299,0.587,0.114)) - centerL;
+                float b = exp(- (dl*dl) / (_BilateralSigma*_BilateralSigma + 1e-5));
+                w *= b;
+            }
+            col += s * w; wSum += w;
+        }
+        col/=max(1e-4,wSum);
+        return float4(col,1);
+    }
+    float4 FragBlurV(Varyings i):SV_Target{
+        float2 t = _BlitTexture_TexelSize.xy;
+        #ifdef DIFFUSION_HQ
+            int R = (int)clamp(_Radius,1,12);
+        #else
+            int R = (int)clamp(_Radius,1,6);
+        #endif
+        float sigma = max(_Radius,1);
+        float twoSigma2 = 2.0*sigma*sigma;
+        float3 col = 0; float wSum=0; float3 center = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv).rgb; float centerL = dot(center, float3(0.299,0.587,0.114));
+        [unroll] for(int r=-8;r<=8;r++){
+            if(abs(r)>R) continue;
+            float w = exp(-(r*r)/twoSigma2);
+            float2 o = float2(0,t.y*r);
+            float3 s = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv+o).rgb;
+            if(_BilateralSigma>0.0001){
+                float dl = dot(s, float3(0.299,0.587,0.114)) - centerL;
+                float b = exp(- (dl*dl) / (_BilateralSigma*_BilateralSigma + 1e-5));
+                w *= b;
+            }
+            col += s * w; wSum += w;
+        }
+        col/=max(1e-4,wSum);
+        return float4(col,1);
+    }
+    float4 FragComposite(Varyings i):SV_Target{
+        float3 src = SAMPLE_TEXTURE2D(_MainTex,sampler_BlitTexture,i.uv).rgb;
+        float3 A = SAMPLE_TEXTURE2D(_BlurATex,sampler_BlurATex,i.uv).rgb;
+        float3 B = SAMPLE_TEXTURE2D(_BlurBTex,sampler_BlurBTex,i.uv).rgb;
+        float w1 = saturate(_Layer1Weight); float w2 = 1.0 - w1;
+        float3 add = A * w1 + B * w2;
+        // 亮度调制：暗部加权 + 高光淡化
+        float L = dot(src, float3(0.299,0.587,0.114));
+        if(_DarkThreshold > 1e-4){
+            float curve = pow(saturate((_DarkThreshold - L)/_DarkThreshold), _DarkPower);
+            add *= curve;
+        }
+        // 高光淡化窗口 (1 - smoothstep)
+        float fade = 1.0 - smoothstep(_HighlightFade.x, _HighlightFade.y, L);
+        add *= fade;
+        // 边缘遮罩（深度 + 法线）
+        if(_EdgeParams1.w > 0.5){
+            float linearDepthC = LinearDepth(i.uv);
+            float2 texel = _BlitTexture_TexelSize.xy;
+            float maxDepthDiff = 0.0;
+            float maxNormalDiff = 0.0;
+            // 四方向
+            const float2 offs[4] = { float2(1,0), float2(-1,0), float2(0,1), float2(0,-1) };
+            float3 nC = 0;
+            // 法线可能未提供时返回 0，做一次尝试采样
+            nC = SAMPLE_TEXTURE2D(_CameraNormalsTexture, sampler_CameraNormalsTexture, i.uv).xyz * 2 - 1;
+            [unroll] for(int k=0;k<4;k++){
+                float2 uvN = i.uv + offs[k]*texel;
+                float linD = LinearDepth(uvN);
+                maxDepthDiff = max(maxDepthDiff, abs(linD - linearDepthC));
+                float3 nS = SAMPLE_TEXTURE2D(_CameraNormalsTexture, sampler_CameraNormalsTexture, uvN).xyz * 2 - 1;
+                float nd = 1 - saturate(dot(nC, nS));
+                maxNormalDiff = max(maxNormalDiff, nd);
+            }
+            float depthFactor = saturate(maxDepthDiff / max(_EdgeParams1.x,1e-6));
+            float normalFactor = saturate(maxNormalDiff / max(_EdgeParams1.y,1e-6));
+            float edge = max(depthFactor, normalFactor);
+            float preserve = 1.0 - _EdgeParams1.z * edge; // edgeStrength
+            add *= preserve;
+        }
+        // 暖色偏
+        add *= _WarmTint.rgb;
+        float3 result = src + add * _Intensity;
+        return float4(result,1);
+    }
+    ENDHLSL
+    SubShader {
+        Tags{"RenderPipeline"="UniversalPipeline"}
+        Cull Off ZWrite Off ZTest Always
+        Pass {
+            Name "Prefilter"
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma multi_compile_local _ DIFFUSION_HQ
+            #pragma multi_compile_instancing
+            #pragma vertex Vert
+            #pragma fragment FragPrefilter
+            ENDHLSL
+        }
+        Pass {
+            Name "BlurH"
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma multi_compile_local _ DIFFUSION_HQ
+            #pragma multi_compile_instancing
+            #pragma vertex Vert
+            #pragma fragment FragBlurH
+            ENDHLSL
+        }
+        Pass {
+            Name "BlurV"
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma multi_compile_local _ DIFFUSION_HQ
+            #pragma multi_compile_instancing
+            #pragma vertex Vert
+            #pragma fragment FragBlurV
+            ENDHLSL
+        }
+        Pass {
+            Name "Composite"
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma multi_compile_local _ DIFFUSION_HQ
+            #pragma multi_compile_instancing
+            #pragma vertex Vert
+            #pragma fragment FragComposite
+            ENDHLSL
+        }
+    }
+}
