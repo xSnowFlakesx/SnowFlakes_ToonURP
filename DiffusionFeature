@@ -1,0 +1,85 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+namespace CustomPostProcessing
+{
+    public class DiffusionFeature : ScriptableRendererFeature
+    {
+        [System.Serializable]
+        public class Settings
+        {
+            public Shader shader;
+            public RenderPassEvent injectionPoint = RenderPassEvent.AfterRenderingPostProcessing;
+        }
+        class Pass : ScriptableRenderPass
+        {
+            private Material _mat; private Settings _settings; private DiffusionVolume _vol;
+            private RTHandle _tmpA; private RTHandle _tmpB; private RTHandle _fullComposite; // full-res composite目标
+            private int _w=-1,_h=-1; private int _fullW=-1,_fullH=-1;
+            public Pass(Material m, Settings s){ _mat=m; _settings=s; ConfigureInput(ScriptableRenderPassInput.Color | ScriptableRenderPassInput.Depth | ScriptableRenderPassInput.Normal); }
+            public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData rd)
+            {
+                var stack = VolumeManager.instance.stack; _vol = stack.GetComponent<DiffusionVolume>();
+                if(_vol==null || !_vol.IsActive()) return; 
+                var fullDesc = rd.cameraData.cameraTargetDescriptor; fullDesc.depthBufferBits=0; fullDesc.msaaSamples=1; // 全分辨率
+                if(fullDesc.width!=_fullW || fullDesc.height!=_fullH){ _fullW=fullDesc.width; _fullH=fullDesc.height; RenderingUtils.ReAllocateIfNeeded(ref _fullComposite, fullDesc, name:"_DiffusionComposite"); }
+                var dsDesc = fullDesc; int ds = Mathf.Clamp(_vol.downsample.value,1,4); int w = fullDesc.width/ds; int h = fullDesc.height/ds; dsDesc.width=w; dsDesc.height=h;
+                if(w!=_w || h!=_h){ _w=w; _h=h; RenderingUtils.ReAllocateIfNeeded(ref _tmpA,dsDesc,name:"_DiffusionA"); RenderingUtils.ReAllocateIfNeeded(ref _tmpB,dsDesc,name:"_DiffusionB"); }
+            }
+            public override void Execute(ScriptableRenderContext ctx, ref RenderingData rd)
+            {
+                if(_vol==null || !_vol.IsActive() || _mat==null) return; var camColor = rd.cameraData.renderer.cameraColorTargetHandle; if(camColor==null||camColor.rt==null) return;
+                var cmd = CommandBufferPool.Get("Diffusion"); using(new ProfilingScope(cmd,new ProfilingSampler("Diffusion")))
+                {
+                    if(_vol.highQuality.value) _mat.EnableKeyword("DIFFUSION_HQ"); else _mat.DisableKeyword("DIFFUSION_HQ");
+                    _mat.SetFloat("_DarkThreshold", _vol.darkThreshold.value);
+                    _mat.SetFloat("_DarkSoftKnee", _vol.darkSoftKnee.value);
+                    _mat.SetFloat("_DarkPower", _vol.darkPower.value);
+                    _mat.SetFloat("_Layer1Weight", _vol.layer1Weight.value);
+                    _mat.SetFloat("_Layer2Scale", _vol.layer2Scale.value);
+                    _mat.SetFloat("_BilateralSigma", _vol.bilateralSigma.value);
+                    _mat.SetVector("_HighlightFade", new Vector4(_vol.highlightFadeStart.value, _vol.highlightFadeEnd.value,0,0));
+                    _mat.SetColor("_WarmTint", _vol.warmTint.value);
+                    if(_vol.preserveEdges.value){
+                        _mat.SetVector("_EdgeParams1", new Vector4(_vol.edgeDepthThreshold.value, _vol.edgeNormalThreshold.value, _vol.edgeStrength.value, 1f));
+                    } else {
+                        _mat.SetVector("_EdgeParams1", new Vector4(0,0,0,0));
+                    }
+                    // Prefilter + downsample
+                    Blitter.BlitCameraTexture(cmd, camColor, _tmpA, _mat, 0);
+                    // Layer1 iterative blur -> result in _tmpA
+                    float baseR = _vol.radius.value; int iter = _vol.iterations.value; 
+                    for(int it=0; it<iter; it++){
+                        float r = baseR * (1f + it*0.4f); _mat.SetFloat("_Radius", r);
+                        Blitter.BlitCameraTexture(cmd, _tmpA, _tmpB, _mat, 1); // H
+                        Blitter.BlitCameraTexture(cmd, _tmpB, _tmpA, _mat, 2); // V
+                    }
+                    // Layer2: start from layer1 result, apply enlarged blur radius (single H+V pair for efficiency)
+                    float layer2Scale = _vol.layer2Scale.value; 
+                    if(layer2Scale > 1.01f){
+                        _mat.SetFloat("_Radius", baseR * layer2Scale);
+                        Blitter.BlitCameraTexture(cmd, _tmpA, _tmpB, _mat, 1); // H
+                        Blitter.BlitCameraTexture(cmd, _tmpB, _tmpB, _mat, 2); // V keep in _tmpB
+                    } else {
+                        // copy if not using second layer
+                        cmd.Blit(_tmpA, _tmpB);
+                    }
+                    // Composite brighten with dual-layer + modulation
+                    _mat.SetFloat("_Intensity", _vol.intensity.value);
+                    cmd.SetGlobalTexture("_BlurATex", _tmpA);
+                    cmd.SetGlobalTexture("_BlurBTex", _tmpB);
+                    if(_mat.passCount>3){
+                        // 不能 src==dst，否则 URP 会回退 CoreBlit (导致未执行合成逻辑)
+                        Blitter.BlitCameraTexture(cmd, camColor, _fullComposite, _mat, 3); // 合成写入临时
+                        Blitter.BlitCameraTexture(cmd, _fullComposite, camColor);        // 拷回
+                    }
+                }
+                ctx.ExecuteCommandBuffer(cmd); CommandBufferPool.Release(cmd);
+            }
+        }
+        public Settings settings = new(); private Material _mat; private Pass _pass;
+        public override void Create(){ if(settings.shader==null) settings.shader=Shader.Find("Hidden/Universal Render Pipeline/Diffusion"); if(settings.shader!=null && (_mat==null||_mat.shader!=settings.shader)) _mat=CoreUtils.CreateEngineMaterial(settings.shader); _pass=new Pass(_mat,settings){ renderPassEvent=settings.injectionPoint }; }
+        public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData){ if(_mat==null) return; renderer.EnqueuePass(_pass); }
+    }
+}
