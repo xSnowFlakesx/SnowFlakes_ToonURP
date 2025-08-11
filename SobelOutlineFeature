@@ -19,6 +19,16 @@ namespace SnowFlakes.Rendering
             [Range(0f,5f)] public float intensity = 1f;
             [Range(0f,1f)] public float threshold = 0.05f;
             [Tooltip("Force vertical flip of source when result appears upside-down")] public bool flipY = false;
+            [Header("High Quality Edge Params")] public bool highQuality = true;
+            [Range(0.001f,0.5f)] public float softness = 0.1f;
+            [Range(1f,4f)] public float bigScale = 2f;
+            [Range(0f,8f)] public float depthScale = 4f;
+            [Range(0f,8f)] public float normalScale = 2f;
+            [Range(0f,2f)] public float smallEdgeWeight = 1f;
+            [Range(0f,2f)] public float bigEdgeWeight = 0.6f;
+            [Range(0f,2f)] public float depthEdgeWeight = 1f;
+            [Range(0f,2f)] public float normalEdgeWeight = 1f;
+            [Range(0,2)] public int blendMode = 0; // 0 overlay 1 add 2 replace
         }
 
         class Pass : ScriptableRenderPass
@@ -66,6 +76,10 @@ namespace SnowFlakes.Rendering
                     _mat.SetVector("_Params", new Vector4(_s.width, _s.depthSensitivity, _s.colorSensitivity, _s.intensity));
                     _mat.SetFloat("_Threshold", _s.threshold);
                     _mat.SetFloat("_FlipY", _s.flipY ? 1f : 0f);
+                    _mat.SetFloat("_HQ", _s.highQuality ? 1f : 0f);
+                    _mat.SetVector("_Params2", new Vector4(_s.softness, _s.bigScale, _s.depthScale, _s.normalScale));
+                    _mat.SetVector("_Mix", new Vector4(_s.smallEdgeWeight, _s.bigEdgeWeight, _s.depthEdgeWeight, _s.normalEdgeWeight));
+                    _mat.SetFloat("_BlendMode", _s.blendMode);
                     // 使用 Blitter 做一次拷贝到临时 RT，再从临时 RT 回写带 outline
                     Blitter.BlitCameraTexture(cmd, source, _tempColor);
                     Blitter.BlitCameraTexture(cmd, _tempColor, source, _mat, 0);
