@@ -1,0 +1,13 @@
+// 修正反射UV计算
+                float2 reflectionUV = (IN.screenPos.xy / IN.screenPos.w) + pixelNormalWS.xz * (_ReflectDistort * 0.02); // 使用xz平面扰动
+                reflectionUV = saturate(reflectionUV); // 防止UV越界
+                
+                // 使用屏幕空间采样
+                float3 ReflectionColor = tex2D(_ReflectionTex, reflectionUV).rgb;
+                return half4(ReflectionColor,1);
+            }
+            ENDHLSL
+        }     
+    }
+    Fallback "Diffuse"
+}
