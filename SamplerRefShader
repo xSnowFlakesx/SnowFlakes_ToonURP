@@ -1,4 +1,132 @@
-// 修正反射UV计算
+Shader "Unlit/Water_Code_URP"
+{
+    Properties
+    {
+        _NormalMap ("Normal Map", 2D) = "bump" {}
+        _NormalMap_ST ("Normal Map ST", Vector) = (1,1,0,0)
+        _BumpScale ("Bump Scale", Float) = 1.0
+        _NormalSpeed ("Normal Speed", Vector) = (1, 1, 0, 0)
+
+        _ReflectionTex ("Reflection", 2D) = "white" {}
+        _ReflectDistort ("Reflection Distort", Range(-5, 5)) = 1.0
+    }
+
+    SubShader
+    {
+        Tags 
+        { 
+            "RenderType" = "Transparent"
+            "Queue" = "Transparent"
+            "RenderPipeline" = "UniversalPipeline"
+        }
+        LOD 100
+
+        Blend SrcAlpha OneMinusSrcAlpha
+        ZWrite Off
+        Cull Back
+
+
+
+        Pass
+        {
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl"
+
+            float3 ReorientNormal(float3 base, float3 detail) {
+                float3 t = base + float3(0.0, 0.0, 1.0);
+                float3 u = detail * float3(-1.0, -1.0, 1.0);
+                return normalize((t / t.z) * dot(t, u) - u);
+            }
+
+
+            struct Attributes
+            {
+                float4 positionOS : POSITION;
+                float4 tangentOS : TANGENT;
+                float3 normalOS : NORMAL;
+                float2 uv : TEXCOORD0;
+                float2 texcoord : TEXCOORD1;
+
+            };
+
+            struct Varyings
+            {
+                float4 positionCS  : SV_POSITION;
+                float2 uv : TEXCOORD0;
+                float4 positionWSAndFogFactor : TEXCOORD1;
+                float3 normalWS : TEXCOORD2;
+                float4 tangentWS : TEXCOORD3;
+                float3 viewDirWS : TEXCOORD4;
+                float4 screenPos : TEXCOORD5; // 新增语义索引 
+                float3 bitangentWS : TEXCOORD6;
+                float3 positionWS : TEXCOORD7;  
+            };
+
+            TEXTURE2D(_MainTex);
+            SAMPLER(sampler_MainTex);
+            TEXTURE2D(_NormalMap);
+            SAMPLER(sampler_NormalMap);
+            TEXTURE2D(_CameraOpaqueTexture);
+            SAMPLER(sampler_CameraOpaqueTexture);
+            sampler2D _ReflectionTex;
+            
+            CBUFFER_START(UnityPerMaterial)
+                float4 _MainTex_ST;
+                float4 _NormalMap_ST;
+                float _BumpScale;
+                float2 _NormalSpeed;
+                float _ReflectDistort;
+            CBUFFER_END
+
+
+            Varyings vert (Attributes IN)
+            {
+                Varyings OUT;
+                OUT.positionCS = TransformObjectToHClip(IN.positionOS.xyz);
+                OUT.uv = IN.uv;
+                OUT.normalWS = TransformObjectToWorldNormal(IN.normalOS);
+                OUT.tangentWS.xyz = TransformObjectToWorldDir(IN.tangentOS.xyz);
+                OUT.tangentWS.w = IN.tangentOS.w * GetOddNegativeScale();
+                OUT.screenPos = ComputeScreenPos(OUT.positionCS);
+                OUT.positionWS = TransformObjectToWorld(IN.positionOS);
+                OUT.bitangentWS = cross(OUT.normalWS, OUT.tangentWS.xyz);
+                OUT.viewDirWS = GetWorldSpaceViewDir(OUT.positionWS);
+                return OUT;
+            }
+
+            half4 frag (Varyings IN) : SV_Target
+            {
+                // 在片元着色器中调用
+                //float2 screenPos = i.screenPos.xy / i.screenPos.w;
+
+                 // 修正TBN矩阵构建
+                float3 normalWS = normalize(IN.normalWS);
+                float3 tangentWS = normalize(IN.tangentWS.xyz);
+                float3 bitangentWS = normalize(cross(normalWS, tangentWS) * IN.tangentWS.w);
+                float3x3 TBN = float3x3(tangentWS, bitangentWS, normalWS);
+                
+
+                // 修正法线采样与混合
+                float2 uv1 = TRANSFORM_TEX(IN.uv, _NormalMap) + _Time.y * _NormalSpeed * 0.01; // 调整速度系数
+                float2 uv2 = TRANSFORM_TEX(IN.uv, _NormalMap) - _Time.y * _NormalSpeed * 0.005; // 添加差异化偏移
+                
+                half3 normalTS1 = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, uv1), _BumpScale);
+                half3 normalTS2 = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, uv2), _BumpScale);
+                
+                // 使用正确法线混合方法
+                half3 blendedNormalTS = normalize(ReorientNormal(normalTS1, normalTS2));
+                
+                // 转换到世界空间
+                float3 pixelNormalWS = normalize(mul(blendedNormalTS, TBN));
+
+                // 修正反射UV计算
                 float2 reflectionUV = (IN.screenPos.xy / IN.screenPos.w) + pixelNormalWS.xz * (_ReflectDistort * 0.02); // 使用xz平面扰动
                 reflectionUV = saturate(reflectionUV); // 防止UV越界
                 
